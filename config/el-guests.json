@@ -2,6 +2,7 @@
   "guests": {
     "ethrex": {},
     "nimbus": {},
-    "reth": {}
+    "reth": {},
+    "zesu": {}
   }
 }
