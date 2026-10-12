@@ -42,8 +42,8 @@ Implemented scripts:
   manifests and deterministically select reusable cross-run artifacts.
 - `convert-zkevm-metrics-to-hive-results.py`: convert `zkevm-benchmark-workload`
   `zkevm-metrics/` output into Hive-compatible result files.
-- `check-smoke-results.py`: require one passing case each for Geth/Hive,
-  Nimbus REST/SSZ/Hive, and Ethrex/ZisK, including metrics conversion;
+- `check-smoke-results.py`: require one passing smoke case from one Hive
+  client (`hive`) or one zkEVM guest, including metrics conversion (`zkevm`);
   see PR smoke check below.
 - `build-site.sh`: generate a static hive-ui site in `SITE_DIR`, write
   `discovery.json` and `listing.jsonl`, copy Hive logs into `results/`, and
@@ -227,9 +227,10 @@ requires at least one generated metrics JSON before returning successfully.
 ### PR smoke check
 
 The PR workflow runs the production scripts against one empty-block
-`blockchain_test_engine` test. Geth and Nimbus REST/SSZ execute it through
-Hive; Ethrex executes it on ZisK. The benchmark downloads its guest
-and runtime image using its own dependency versions.
+`blockchain_test_engine` test. Geth executes it through Hive, and so does
+Nimbus REST/SSZ when Hive-related files change. Every guest pair in
+`refresh-dashboard.yml` executes it on its zkVM. The benchmark downloads its
+guests and runtime images using its own dependency versions.
 
 Run these commands from the dashboard repository root with the
 [local prerequisites](../README.md#local-prerequisites) installed. They update
@@ -241,43 +242,46 @@ the generated source checkouts and replace outputs under `smoke-results/`.
   export FILLER_PATH=tests/amsterdam/eip8025_optional_proofs/test_witness_headers.py::test_witness_headers_empty_block
   export FILL_TEST_NAME=0
   export FIXTURES_DIR="$PWD/smoke-results/fixtures"
-  export HIVE_CLIENT_RESULTS_DIR="$PWD/smoke-results/hive-results"
-  export ZKEVM_METRICS_DIR="$PWD/smoke-results/metrics"
-  export EL_CLIENTS=go-ethereum,nimbus-el-rest HIVE_PARALLELISM=1
+  export HIVE_CLIENT_RESULTS_DIR="$PWD/smoke-results/hive-results" HIVE_PARALLELISM=1
   export HIVE_CONSUME_ALLOW_FAILURE=0 HIVE_PRUNE_SKIPPED=0 HIVE_LOG_TO_STDOUT=1
   export ZKEVM_RAYON_THREADS=2 ERE_IMAGE_REGISTRY=ghcr.io/eth-act/ere
 
   set -e
-  scripts/setup-zkevm-benchmark-workload.sh
   scripts/prepare-fixtures.sh
+
   scripts/run-hive-consume-client.sh go-ethereum
-  scripts/run-hive-consume-client.sh nimbus-el-rest
-  scripts/run-zkevm-benchmark-workload.sh ethrex zisk
-  python3 scripts/convert-zkevm-metrics-to-hive-results.py \
-    --input "$ZKEVM_METRICS_DIR" --output smoke-results/converted --clean-output
-  python3 scripts/check-smoke-results.py \
-    --fixtures "$FIXTURES_DIR" \
-    --hive-results "$HIVE_CLIENT_RESULTS_DIR/go-ethereum" \
-    --nimbus-hive-results "$HIVE_CLIENT_RESULTS_DIR/nimbus-el-rest" \
-    --metrics "$ZKEVM_METRICS_DIR" \
-    --converted-results smoke-results/converted
+  python3 scripts/check-smoke-results.py hive --fixtures "$FIXTURES_DIR" \
+    --results "$HIVE_CLIENT_RESULTS_DIR/go-ethereum" --client go-ethereum_rlp-engineapi
+
+  scripts/setup-zkevm-benchmark-workload.sh
+  ZKEVM_METRICS_DIR="$PWD/smoke-results/metrics/ethrex-zisk" \
+    scripts/run-zkevm-benchmark-workload.sh ethrex zisk
+  python3 scripts/convert-zkevm-metrics-to-hive-results.py --clean-output \
+    --input smoke-results/metrics/ethrex-zisk --output smoke-results/converted/ethrex-zisk
+  python3 scripts/check-smoke-results.py zkevm --fixtures "$FIXTURES_DIR" \
+    --metrics smoke-results/metrics/ethrex-zisk \
+    --converted smoke-results/converted/ethrex-zisk --client ethrex --zkvm zisk
 )
 ```
 
-The result checker exits nonzero unless the engine fixture contains the
-selected case, both Hive clients pass it without skipping, the guest output
-matches, and conversion preserves the passing result. It reads the fixture index and
-result files; it does not prepare or execute workloads.
+For another guest, repeat the run, convert, and check commands with its client
+and zkVM. For Nimbus REST/SSZ, run
+`scripts/run-hive-consume-client.sh nimbus-el-rest` and check it with
+`--client nimbus-el_rest-ssz`.
 
-CI installs Python, Go, Rust nightly, uv, and the native packages listed in
-`.github/workflows/pr-smoke.yml`. It authenticates to GHCR with the job token,
-caches dependencies and Rust build outputs, and runs on a disposable XL
-runner with a 90-minute timeout. The summary records elapsed time and cache
-hits. Cold runs can take longer because they build Geth, Nimbus, and the
-benchmark.
-Fixtures, results, and Hive logs are uploaded for seven days, with build output
-in the step logs. The final **PR smoke** gate requires both local checks and
-real execution to pass. It creates diagnostic artifacts only.
+The `hive` check exits nonzero unless the engine fixture contains the selected
+case and the named Hive client passes it without skipping. The `zkevm` check
+also requires the guest output to match and the conversion to preserve the
+passing result. Both read the fixture index and result files; they do not
+prepare or execute workloads.
+
+CI installs Python, Go, Rust stable, uv, and the native packages listed in
+`.github/workflows/pr-smoke.yml` and `.github/actions/smoke-setup`. The zkEVM
+jobs authenticate to GHCR with the job token, and each lists its guest results
+and Rust cache hit in its summary. Cold runs take longer because they build
+Geth, Nimbus, and the benchmark and pull the zkVM images. Every job uploads its
+fixtures, results, and Hive logs for seven days. The final **PR smoke** gate
+requires every selected job to pass and notes when it skipped Nimbus.
 
 ### Metrics conversion
 

@@ -192,7 +192,7 @@ Local runs use the same tools as CI:
 
 - Docker, usable without `sudo`. Hive builds and runs client containers, so
   `docker info` must succeed.
-- Git, Rust nightly with `cargo`, Go `1.24.x`, Node.js `22.x` with npm, and
+- Git, Rust stable with `cargo`, Go `1.24.x`, Node.js `22.x` with npm, and
   Python `3.12`.
 - `uv`, `jq`, `curl`, and `rsync` on `PATH`.
 
@@ -357,15 +357,28 @@ for secrets and private RPC URLs.
 ## PR smoke check
 
 The **PR smoke** check runs the unit tests, then fills one empty-block
-`blockchain_test_engine` test. Geth and Nimbus REST/SSZ run it on Hive and
-Ethrex runs it on ZisK, using the same scripts as `run-workloads.yml`. The check
-converts the zkEVM metrics and fails unless each workload produces exactly one
-passing case. It does not generate proofs, publish datasets, or deploy the site.
+`blockchain_test_engine` test and runs it in parallel jobs. They use the same
+scripts as `run-workloads.yml` and `publish.yml`:
 
-The check runs on a disposable XL runner with a 90-minute timeout. Caches speed
-up repeat runs, but cold runs still compile the benchmark and build Geth and
-Nimbus. The job summary records elapsed time and cache hits. Fixtures, results,
-and Hive logs stay available for seven days.
+- Geth runs it on Hive.
+- Nimbus REST/SSZ runs it on Hive when the pull request changes the Hive
+  scripts or patches, `config/el-clients.json`, `scripts/env.sh`, the result
+  checker, or the smoke workflow. Its image takes about 30 minutes to build;
+  the refresh always runs it.
+- One job per zkVM runs every guest that the refresh runs on that zkVM. The
+  pairs come from `refresh-dashboard.yml`, so new refresh pairs join the smoke.
+- A site job merges the Geth and zkEVM results, builds the hive-ui site, and
+  runs `scripts/smoke-site.sh`.
+
+Each workload must produce exactly one passing case, and the site must list
+every result. The check does not generate proofs, publish datasets, or deploy
+the site.
+
+The jobs run on disposable XL runners. Pushes to `main` build the benchmark
+and save its Rust cache, which pull requests and refreshes restore. Both use
+stable Rust, so the cache lasts until the next Rust release or workload
+version. Results, fixtures, Hive logs, and the built site stay available for
+seven days.
 
 Use `PR smoke` as the required check name in branch protection. To reproduce
 the run, see [the local commands](scripts/README.md#pr-smoke-check).

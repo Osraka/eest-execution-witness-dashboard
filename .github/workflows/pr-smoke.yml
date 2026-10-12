@@ -1,13 +1,16 @@
-name: PR execution witness smoke
+name: Execution witness smoke
 
 on:
   pull_request:
+  # Builds on main save the Rust cache that pull requests restore.
+  push:
+    branches: [main]
 
 permissions:
   contents: read
 
 concurrency:
-  group: pr-smoke-${{ github.event.pull_request.number }}
+  group: pr-smoke-${{ github.event.pull_request.number || github.ref }}
   cancel-in-progress: true
 
 jobs:
@@ -15,10 +18,16 @@ jobs:
     name: Local checks
     runs-on: ubuntu-latest
     timeout-minutes: 10
+    outputs:
+      nimbus: ${{ steps.changes.outputs.nimbus }}
+      zkevm_count: ${{ steps.zkevm.outputs.count }}
+      zkevm_matrix: ${{ steps.zkevm.outputs.matrix }}
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
+          # The pull request merge commit and its base parent give the changed files.
+          fetch-depth: 2
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -32,46 +41,241 @@ jobs:
           jq -e '.guests | type == "object"' config/el-guests.json
           scripts/env.sh --validate-eest-source
           EL_CLIENTS=go-ethereum,ethrex,nethermind,nimbus-el,besu,nimbus-el-rest scripts/list-el-clients.sh --github-matrix
-          ZKEVM_WORKLOAD_RUNS=ethrex:zisk,reth:zisk,zesu:zisk,nimbus:zisk scripts/list-zkevm-workload-runs.sh --json
           python3 -m unittest discover -s tests
+      - name: Group the refresh's zkEVM runs by zkVM
+        id: zkevm
+        run: |
+          set -Eeuo pipefail
+          # Smoke every guest the refresh runs.
+          runs="$(sed -n 's/^ *ZKEVM_WORKLOAD_RUNS: *//p' .github/workflows/refresh-dashboard.yml)"
+          if [ -z "$runs" ] || [ "$(wc -l <<< "$runs")" -ne 1 ]; then
+            echo "refresh-dashboard.yml must set ZKEVM_WORKLOAD_RUNS exactly once" >&2
+            exit 1
+          fi
+          runs="$(ZKEVM_WORKLOAD_RUNS="$runs" scripts/list-zkevm-workload-runs.sh --json)"
+          matrix="$(jq -c '
+            group_by(.zkvm)
+            | map({zkvm: .[0].zkvm, clients: (map(.execution_client) | join(" "))})
+            | {include: .}
+          ' <<< "$runs")"
+          jq . <<< "$matrix"
+          {
+            echo "count=$(jq length <<< "$runs")"
+            echo "matrix=$matrix"
+          } >> "$GITHUB_OUTPUT"
+      - name: Decide whether Nimbus runs
+        id: changes
+        if: github.event_name == 'pull_request'
+        run: |
+          set -Eeuo pipefail
+          # Nimbus takes about 30 minutes to build, so it runs only when a
+          # change can affect Hive or REST/SSZ. The refresh always runs it.
+          changed="$(git diff --name-only HEAD^1 HEAD)"
+          nimbus=false
+          while IFS= read -r path; do
+            case "$path" in
+              .github/actions/* | .github/workflows/pr-smoke.yml | config/el-clients.json | \
+                patches/hive-* | scripts/env.sh | scripts/lib/* | scripts/setup-hive.sh | \
+                scripts/run-hive-consume-client.sh | scripts/prepare-fixtures.sh | \
+                scripts/prune-skipped-hive-results.py | scripts/check-smoke-results.py)
+                echo "Nimbus runs because $path changed"
+                nimbus=true
+                ;;
+            esac
+          done <<< "$changed"
+          echo "nimbus=$nimbus" >> "$GITHUB_OUTPUT"
 
-  smoke:
-    name: Execution smoke
+  geth:
+    name: Hive go-ethereum
     needs: checks
+    if: github.event_name == 'pull_request'
     runs-on: [self-hosted-ghr, size-xl-x64]
-    timeout-minutes: 90
-    permissions:
-      contents: read
-      packages: read
+    timeout-minutes: 30
     env:
-      ROOT_DIR: ${{ github.workspace }}
-      EEST_DIR: ${{ github.workspace }}/execution-specs
-      HIVE_DIR: ${{ github.workspace }}/hive
-      ZKEVM_BENCHMARK_WORKLOAD_DIR: ${{ github.workspace }}/zkevm-benchmark-workload
       EEST_RELEASE_TAG: ""
       FILLER_PATH: tests/amsterdam/eip8025_optional_proofs/test_witness_headers.py::test_witness_headers_empty_block
       FILL_TEST_NAME: "0"
       FIXTURES_DIR: ${{ github.workspace }}/smoke-results/fixtures
       HIVE_CLIENT_RESULTS_DIR: ${{ github.workspace }}/smoke-results/hive-results
-      ZKEVM_METRICS_DIR: ${{ github.workspace }}/smoke-results/metrics
-      EL_CLIENTS: go-ethereum,nimbus-el-rest
+      HIVE_PARALLELISM: "1"
+      HIVE_CONSUME_ALLOW_FAILURE: "0"
+      HIVE_PRUNE_SKIPPED: "0"
+      HIVE_LOG_TO_STDOUT: "1"
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/smoke-setup
+        with:
+          save-cache: "true"
+      - name: Run Geth through Hive
+        run: scripts/run-hive-consume-client.sh go-ethereum
+      - name: Check the Hive result
+        run: |
+          python3 scripts/check-smoke-results.py hive --fixtures "$FIXTURES_DIR" \
+            --results "$HIVE_CLIENT_RESULTS_DIR/go-ethereum" --client go-ethereum_rlp-engineapi
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-hive-go-ethereum
+          overwrite: true
+          retention-days: 7
+          if-no-files-found: warn
+          include-hidden-files: true
+          path: smoke-results/
+
+  nimbus:
+    name: Hive nimbus-el-rest
+    needs: checks
+    if: needs.checks.outputs.nimbus == 'true'
+    runs-on: [self-hosted-ghr, size-xl-x64]
+    timeout-minutes: 90
+    env:
+      EEST_RELEASE_TAG: ""
+      FILLER_PATH: tests/amsterdam/eip8025_optional_proofs/test_witness_headers.py::test_witness_headers_empty_block
+      FILL_TEST_NAME: "0"
+      FIXTURES_DIR: ${{ github.workspace }}/smoke-results/fixtures
+      HIVE_CLIENT_RESULTS_DIR: ${{ github.workspace }}/smoke-results/hive-results
       HIVE_PARALLELISM: "1"
       # A cold Nimbus image build exceeds the default 20-minute readiness wait.
       HIVE_READY_ATTEMPTS: "1800"
       HIVE_CONSUME_ALLOW_FAILURE: "0"
       HIVE_PRUNE_SKIPPED: "0"
       HIVE_LOG_TO_STDOUT: "1"
-      ZKEVM_WORKLOAD_RUNS: ethrex:zisk
-      ZKEVM_RAYON_THREADS: "2"
-      ERE_IMAGE_REGISTRY: ghcr.io/eth-act/ere
     steps:
       - uses: actions/checkout@v6
         with:
           persist-credentials: false
-      - name: Set cache directory and start time
+      - uses: ./.github/actions/smoke-setup
+      - name: Run Nimbus REST/SSZ through Hive
+        run: scripts/run-hive-consume-client.sh nimbus-el-rest
+      - name: Check the Hive result
         run: |
-          printf 'UV_CACHE_DIR=%s/uv-cache\n' "$RUNNER_TEMP" >> "$GITHUB_ENV"
-          echo "SMOKE_STARTED_AT=$(date +%s)" >> "$GITHUB_ENV"
+          python3 scripts/check-smoke-results.py hive --fixtures "$FIXTURES_DIR" \
+            --results "$HIVE_CLIENT_RESULTS_DIR/nimbus-el-rest" --client nimbus-el_rest-ssz
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-hive-nimbus-el-rest
+          overwrite: true
+          retention-days: 7
+          if-no-files-found: warn
+          include-hidden-files: true
+          path: smoke-results/
+
+  zkevm:
+    name: zkEVM ${{ matrix.zkvm }}
+    needs: checks
+    if: github.event_name == 'pull_request'
+    runs-on: [self-hosted-ghr, size-xl-x64]
+    # A cold job takes about 10 minutes. The limit stops a hung benchmark host.
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: read
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJson(needs.checks.outputs.zkevm_matrix) }}
+    env:
+      EEST_RELEASE_TAG: ""
+      FILLER_PATH: tests/amsterdam/eip8025_optional_proofs/test_witness_headers.py::test_witness_headers_empty_block
+      FILL_TEST_NAME: "0"
+      FIXTURES_DIR: ${{ github.workspace }}/smoke-results/fixtures
+      ZKEVM_BENCHMARK_WORKLOAD_DIR: ${{ github.workspace }}/zkevm-benchmark-workload
+      ZKEVM_RAYON_THREADS: "2"
+      ERE_IMAGE_REGISTRY: ghcr.io/eth-act/ere
+      GITHUB_TOKEN: ${{ github.token }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+      - uses: ./.github/actions/smoke-setup
+        with:
+          apt-packages: >-
+            build-essential clang libclang-dev libssl-dev pkg-config cmake libbenchmark-dev
+            libgmp-dev libomp-dev libopenmpi-dev libsodium-dev nasm nlohmann-json3-dev
+            openmpi-bin openmpi-common
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Prepare benchmark checkout
+        id: workload
+        run: |
+          scripts/setup-zkevm-benchmark-workload.sh
+          echo "commit=$(git -C "$ZKEVM_BENCHMARK_WORKLOAD_DIR" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+      - name: Cache Rust build outputs
+        id: rust-cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          # Same key and paths as run-workloads.yml, so refreshes and smoke runs share it.
+          workspaces: ${{ env.ZKEVM_BENCHMARK_WORKLOAD_DIR }} -> target
+          shared-key: zkevm-benchmark-workload-${{ steps.workload.outputs.commit }}
+          # Every zkVM job builds the same binary, so one job saves it.
+          save-if: ${{ matrix.zkvm == 'zisk' }}
+      - name: Build the benchmark runner
+        working-directory: ${{ env.ZKEVM_BENCHMARK_WORKLOAD_DIR }}
+        run: cargo build --locked --release -p ere-hosts
+      - name: Run and check each guest
+        env:
+          ZKVM: ${{ matrix.zkvm }}
+          CLIENTS: ${{ matrix.clients }}
+          CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
+        run: |
+          set -Eeuo pipefail
+          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          echo "Rust cache hit: ${CACHE_HIT:-false}" >> "$GITHUB_STEP_SUMMARY"
+          failed=()
+          for client in $CLIENTS; do
+            run="$client-$ZKVM"
+            echo "::group::$client on $ZKVM"
+            if ZKEVM_METRICS_DIR="$PWD/smoke-results/metrics/$run" \
+                scripts/run-zkevm-benchmark-workload.sh "$client" "$ZKVM" &&
+              python3 scripts/convert-zkevm-metrics-to-hive-results.py \
+                --input "smoke-results/metrics/$run" --output "smoke-results/converted/$run" \
+                --clean-output &&
+              python3 scripts/check-smoke-results.py zkevm --fixtures "$FIXTURES_DIR" \
+                --metrics "smoke-results/metrics/$run" --converted "smoke-results/converted/$run" \
+                --client "$client" --zkvm "$ZKVM"; then
+              result=passed
+            else
+              result=failed
+              failed+=("$client")
+            fi
+            echo "::endgroup::"
+            echo "- $client on $ZKVM: $result" >> "$GITHUB_STEP_SUMMARY"
+          done
+          if [ "${#failed[@]}" -gt 0 ]; then
+            echo "::error::Guests failed on $ZKVM: ${failed[*]}"
+            exit 1
+          fi
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-zkevm-${{ matrix.zkvm }}
+          overwrite: true
+          retention-days: 7
+          if-no-files-found: warn
+          include-hidden-files: true
+          path: smoke-results/
+
+  site:
+    name: Site build
+    needs: [checks, geth, zkevm]
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      EL_CLIENTS: go-ethereum
+      HIVE_CLIENT_RESULTS_DIR: ${{ github.workspace }}/smoke-inputs/hive/hive-results
+      ZKEVM_METRICS_ARTIFACTS_DIR: ${{ github.workspace }}/smoke-inputs/zkevm/metrics
+      ZKEVM_CONVERTED_RESULTS_DIR: ${{ github.workspace }}/smoke-inputs/zkevm-converted
+      ZKEVM_COUNT: ${{ needs.checks.outputs.zkevm_count }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - uses: actions/setup-python@v6
         with:
           python-version: "3.12"
@@ -79,96 +283,124 @@ jobs:
         with:
           go-version: stable
           cache: false
-      - uses: astral-sh/setup-uv@v8.1.0
-      - uses: dtolnay/rust-toolchain@nightly
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22.x
+      - name: Install apt packages
+        run: sudo apt-get update && sudo apt-get install -y jq rsync
+      - name: Download Geth results
+        uses: actions/download-artifact@v8
+        with:
+          name: smoke-hive-go-ethereum
+          path: smoke-inputs/hive
+      - name: Download zkEVM results
+        uses: actions/download-artifact@v8
+        with:
+          pattern: smoke-zkevm-*
+          path: smoke-inputs/zkevm
+          merge-multiple: true
+      - name: Prepare Hive checkout for hiveview
+        run: scripts/setup-hive.sh
+      # Mirrors the conversion and merge in publish.yml.
+      - name: Convert zkEVM metrics and merge all results
+        run: |
+          set -Eeuo pipefail
+          merge_args=()
+          converted_count=0
+          while IFS= read -r -d '' metrics_dir; do
+            output_dir="$ZKEVM_CONVERTED_RESULTS_DIR/$(basename "$metrics_dir")"
+            python3 scripts/convert-zkevm-metrics-to-hive-results.py \
+              --input "$metrics_dir" \
+              --output "$output_dir" \
+              --clean-output
+            merge_args+=(--source "$output_dir")
+            converted_count=$((converted_count + 1))
+          done < <(scripts/list-zkevm-metrics-roots.sh --null "$ZKEVM_METRICS_ARTIFACTS_DIR")
+
+          if [ "$converted_count" -ne "$ZKEVM_COUNT" ]; then
+            echo "Expected $ZKEVM_COUNT zkEVM metrics roots, found $converted_count" >&2
+            exit 1
+          fi
+          scripts/merge-hive-results.sh "${merge_args[@]}"
+      - name: Build static hive-ui site
+        run: scripts/build-site.sh
+      - name: Smoke test generated site
+        run: |
+          set -Eeuo pipefail
+          scripts/smoke-site.sh
+          # One Geth suite plus one suite per zkEVM run.
+          listed="$(jq -s length site/listing.jsonl)"
+          if [ "$listed" -ne $((ZKEVM_COUNT + 1)) ]; then
+            echo "Expected $((ZKEVM_COUNT + 1)) suites in listing.jsonl, found $listed" >&2
+            exit 1
+          fi
+      - name: Upload site
+        if: always()
+        uses: actions/upload-artifact@v7
+        with:
+          name: smoke-site
+          overwrite: true
+          retention-days: 7
+          if-no-files-found: warn
+          path: site/
+
+  rust-cache:
+    name: Warm Rust cache
+    if: github.event_name == 'push'
+    runs-on: [self-hosted-ghr, size-xl-x64]
+    timeout-minutes: 60
+    env:
+      ZKEVM_BENCHMARK_WORKLOAD_DIR: ${{ github.workspace }}/zkevm-benchmark-workload
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          persist-credentials: false
       - name: Install native prerequisites
         run: |
           sudo apt-get update
-          sudo apt-get install -y build-essential clang curl jq libclang-dev libssl-dev pkg-config \
+          sudo apt-get install -y build-essential clang jq libclang-dev libssl-dev pkg-config \
             cmake libbenchmark-dev libgmp-dev libomp-dev libopenmpi-dev libsodium-dev \
             nasm nlohmann-json3-dev openmpi-bin openmpi-common
+      - uses: dtolnay/rust-toolchain@stable
       - name: Prepare benchmark checkout
         id: workload
         run: |
           scripts/setup-zkevm-benchmark-workload.sh
           echo "commit=$(git -C "$ZKEVM_BENCHMARK_WORKLOAD_DIR" rev-parse HEAD)" >> "$GITHUB_OUTPUT"
-      - name: Cache Rust dependencies and build outputs
-        id: rust-cache
+      - name: Cache Rust build outputs
         uses: Swatinem/rust-cache@v2
         with:
-          workspaces: zkevm-benchmark-workload -> target
-          shared-key: pr-smoke-${{ steps.workload.outputs.commit }}
-      - name: Cache Go and Python dependencies
-        id: dependency-cache
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/go/pkg/mod
-            ~/.cache/go-build
-            ${{ env.UV_CACHE_DIR }}
-          key: pr-smoke-deps-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('scripts/env.sh') }}
-          restore-keys: pr-smoke-deps-${{ runner.os }}-${{ runner.arch }}-
-      - name: Fill empty-block fixtures
-        run: scripts/prepare-fixtures.sh
-      - name: Run Geth through Hive
-        run: scripts/run-hive-consume-client.sh go-ethereum
-      - name: Run Nimbus REST/SSZ through Hive
-        run: scripts/run-hive-consume-client.sh nimbus-el-rest
-      - name: Run Ethrex on ZisK
-        env:
-          GITHUB_TOKEN: ${{ github.token }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          printf '%s' "$GITHUB_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
-          scripts/run-zkevm-benchmark-workload.sh ethrex zisk
-      - name: Convert metrics and check results
-        run: |
-          python3 scripts/convert-zkevm-metrics-to-hive-results.py \
-            --input "$ZKEVM_METRICS_DIR" --output smoke-results/converted --clean-output
-          python3 scripts/check-smoke-results.py \
-            --fixtures "$FIXTURES_DIR" \
-            --hive-results "$HIVE_CLIENT_RESULTS_DIR/go-ethereum" \
-            --nimbus-hive-results "$HIVE_CLIENT_RESULTS_DIR/nimbus-el-rest" \
-            --metrics "$ZKEVM_METRICS_DIR" \
-            --converted-results smoke-results/converted
-      - name: Summarize smoke result
-        if: always()
-        env:
-          SMOKE_STATUS: ${{ job.status }}
-          RUST_CACHE_HIT: ${{ steps.rust-cache.outputs.cache-hit }}
-          DEPENDENCY_CACHE_HIT: ${{ steps.dependency-cache.outputs.cache-hit }}
-        run: |
-          {
-            echo "Geth/Hive, Nimbus REST/SSZ/Hive, and Ethrex/ZisK empty-block smoke: $SMOKE_STATUS"
-            if [ -n "${SMOKE_STARTED_AT:-}" ]; then
-              echo "Elapsed: $(( $(date +%s) - SMOKE_STARTED_AT )) seconds"
-            fi
-            echo "Rust cache hit: ${RUST_CACHE_HIT:-false}"
-            echo "Go/Python cache hit: ${DEPENDENCY_CACHE_HIT:-false}"
-          } >> "$GITHUB_STEP_SUMMARY"
-      - name: Upload diagnostics
-        if: always()
-        uses: actions/upload-artifact@v7
-        with:
-          name: pr-smoke-${{ github.event.pull_request.number }}-${{ github.run_attempt }}
-          retention-days: 7
-          if-no-files-found: warn
-          include-hidden-files: true
-          path: smoke-results/
+          workspaces: ${{ env.ZKEVM_BENCHMARK_WORKLOAD_DIR }} -> target
+          shared-key: zkevm-benchmark-workload-${{ steps.workload.outputs.commit }}
+      - name: Build the benchmark runner
+        working-directory: ${{ env.ZKEVM_BENCHMARK_WORKLOAD_DIR }}
+        run: cargo build --locked --release -p ere-hosts
 
   gate:
     name: PR smoke
-    needs: [checks, smoke]
-    if: always()
+    needs: [checks, geth, nimbus, zkevm, site]
+    if: always() && github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions: {}
     steps:
-      - name: Require every check to succeed
+      - name: Require every selected job to succeed
         env:
           CHECKS_RESULT: ${{ needs.checks.result }}
-          SMOKE_RESULT: ${{ needs.smoke.result }}
+          GETH_RESULT: ${{ needs.geth.result }}
+          NIMBUS_RESULT: ${{ needs.nimbus.result }}
+          NIMBUS_SELECTED: ${{ needs.checks.outputs.nimbus }}
+          ZKEVM_RESULT: ${{ needs.zkevm.result }}
+          SITE_RESULT: ${{ needs.site.result }}
         run: |
           set -Eeuo pipefail
+          nimbus_expected=success
+          if [ "$NIMBUS_SELECTED" != true ]; then
+            nimbus_expected=skipped
+            echo "Nimbus REST/SSZ skipped: no Hive-related files changed." >> "$GITHUB_STEP_SUMMARY"
+          fi
           test "$CHECKS_RESULT" = success
-          test "$SMOKE_RESULT" = success
+          test "$GETH_RESULT" = success
+          test "$NIMBUS_RESULT" = "$nimbus_expected"
+          test "$ZKEVM_RESULT" = success
+          test "$SITE_RESULT" = success

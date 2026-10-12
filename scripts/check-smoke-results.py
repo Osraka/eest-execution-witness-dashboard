@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Check the Geth, Nimbus REST/SSZ, and Ethrex/ZisK empty-block smoke results."""
+"""Check one Hive client or zkEVM guest result from the empty-block smoke."""
 
 import argparse
 import importlib.util
@@ -44,6 +44,21 @@ def fixture(root, index, directory, format_name):
     return name, path, case
 
 
+def smoke_fixture(fixtures):
+    index = prune.load_json(fixtures / ".meta/index.json")["test_cases"]
+    engine_name, engine_path, engine_case = fixture(
+        fixtures, index, "blockchain_tests_engine", "blockchain_test_engine"
+    )
+    payload = one(engine_case["engineNewPayloads"], "empty-block fixture payload")
+    for field in ("statelessInputBytes", "statelessOutputBytes"):
+        require(re.fullmatch(r"(?:0x)?(?:[0-9a-fA-F]{2})+", payload.get(field, "")),
+                f"fixture has no valid {field}")
+    # The workload reads blockchain_tests_engine directly, so its source paths
+    # are relative to that directory.
+    source_path = Path(engine_path).relative_to("blockchain_tests_engine").as_posix()
+    return engine_name, source_path
+
+
 def hive_case(directory):
     path = one(prune.suite_json_files(directory), f"{directory} suite")
     suite = prune.load_json(path)
@@ -57,31 +72,19 @@ def hive_case(directory):
     return case["name"], client
 
 
-def check(fixtures, hive_results, nimbus_hive_results, metrics, converted_results):
-    index = prune.load_json(fixtures / ".meta/index.json")["test_cases"]
-    engine_name, engine_path, engine_case = fixture(
-        fixtures, index, "blockchain_tests_engine", "blockchain_test_engine"
-    )
-    payload = one(engine_case["engineNewPayloads"], "empty-block fixture payload")
-    for field in ("statelessInputBytes", "statelessOutputBytes"):
-        require(re.fullmatch(r"(?:0x)?(?:[0-9a-fA-F]{2})+", payload.get(field, "")),
-                f"fixture has no valid {field}")
-    # The workload reads blockchain_tests_engine directly, so its source paths
-    # are relative to that directory.
-    source_path = Path(engine_path).relative_to("blockchain_tests_engine").as_posix()
-
-    name, client = hive_case(hive_results)
+def check_hive(fixtures, results, client):
+    engine_name, _ = smoke_fixture(fixtures)
+    name, actual = hive_case(results)
     require(engine_name in name, f"unexpected Hive case: {name}")
-    require(client == "go-ethereum" or client.startswith("go-ethereum_"),
-            f"unexpected Hive client: {client}")
+    require(actual == client, f"unexpected Hive client: {actual}")
 
-    name, client = hive_case(nimbus_hive_results)
-    require(engine_name in name, f"unexpected Nimbus Hive case: {name}")
-    require(client == "nimbus-el_rest-ssz", f"unexpected Nimbus Hive client: {client}")
 
+def check_zkevm(fixtures, metrics, converted, client, zkvm):
+    engine_name, source_path = smoke_fixture(fixtures)
     path = one((path for path in metrics.glob("*/*/*.json") if path.name != "hardware.json"),
-               "Ethrex/ZisK metric")
-    require(path.parent.parent.name.startswith("ethrex-") and path.parent.name.startswith("zisk-"),
+               f"{client}/{zkvm} metric")
+    require(path.parent.parent.name.startswith(f"{client}-")
+            and path.parent.name.startswith(f"{zkvm}-"),
             f"unexpected metric client or zkVM: {path}")
     metric = prune.load_json(path)
     metadata = metric["metadata"]
@@ -92,23 +95,40 @@ def check(fixtures, hive_results, nimbus_hive_results, metrics, converted_result
             (execution.get("success") or {}).get("output_matched") is True,
             f"guest execution failed or output mismatched: {path}")
 
-    name, client = hive_case(converted_results)
+    name, actual = hive_case(converted)
     require(name == metric["name"], f"converted case does not match metric: {name}")
-    require(client == f"ethrex_{path.parent.name}", f"unexpected converted client: {client}")
+    require(actual == f"{client}_{path.parent.name}", f"unexpected converted client: {actual}")
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    for name in ("fixtures", "hive-results", "nimbus-hive-results", "metrics", "converted-results"):
-        parser.add_argument("--" + name, type=Path, required=True)
-    args = parser.parse_args()
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    hive = commands.add_parser("hive", help="Check one Hive client result.")
+    hive.add_argument("--fixtures", type=Path, required=True)
+    hive.add_argument("--results", type=Path, required=True)
+    hive.add_argument("--client", required=True, help="Full Hive client name.")
+
+    zkevm = commands.add_parser("zkevm", help="Check one zkEVM guest result.")
+    zkevm.add_argument("--fixtures", type=Path, required=True)
+    zkevm.add_argument("--metrics", type=Path, required=True)
+    zkevm.add_argument("--converted", type=Path, required=True)
+    zkevm.add_argument("--client", required=True, help="Workload execution client.")
+    zkevm.add_argument("--zkvm", required=True)
+
+    args = vars(parser.parse_args())
+    command = args.pop("command")
     try:
-        check(**vars(args))
+        if command == "hive":
+            check_hive(**args)
+            label = f"{args['client']} through Hive"
+        else:
+            check_zkevm(**args)
+            label = f"{args['client']} on {args['zkvm']}"
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as exc:
         print(f"smoke failed: {exc}", file=sys.stderr)
         return 1
-    print("Smoke passed: one Geth/Hive case, one Nimbus REST/SSZ/Hive case, "
-          "and one Ethrex/ZisK case, including conversion.")
+    print(f"Smoke passed: one {label} case.")
     return 0
 
 
