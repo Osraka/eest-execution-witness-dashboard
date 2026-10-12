@@ -67,27 +67,60 @@ class CheckSmokeResultsTests(unittest.TestCase):
                                       "execution_duration": {"secs": 1, "nanos": 0}}},
         })
         write_json(self.paths["metrics"] / "hardware.json", {})
-        result = subprocess.run(
-            [sys.executable, str(REPO / "scripts/convert-zkevm-metrics-to-hive-results.py"),
-             "--input", str(self.paths["metrics"]), "--output", str(self.paths["converted_results"])],
-            capture_output=True, text=True, timeout=10,
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.convert(self.paths["metrics"], self.paths["converted_results"])
         self.converted_path = next(self.paths["converted_results"].glob("*.json"))
 
     def check(self):
-        smoke.check(**self.paths)
+        fixtures = self.paths["fixtures"]
+        smoke.check_hive(fixtures, self.paths["hive_results"], "go-ethereum_rlp-engineapi")
+        smoke.check_hive(fixtures, self.paths["nimbus_hive_results"], "nimbus-el_rest-ssz")
+        smoke.check_zkevm(fixtures, self.paths["metrics"], self.paths["converted_results"],
+                          "ethrex", "zisk")
 
-    def run_cli(self):
-        args = [sys.executable, str(SCRIPT)]
-        for key, path in self.paths.items():
-            args += ["--" + key.replace("_", "-"), str(path)]
-        return subprocess.run(args, capture_output=True, text=True, timeout=10)
+    def convert(self, metrics, converted):
+        result = subprocess.run(
+            [sys.executable, str(REPO / "scripts/convert-zkevm-metrics-to-hive-results.py"),
+             "--input", str(metrics), "--output", str(converted)],
+            capture_output=True, text=True, timeout=10,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def run_cli(self, *args):
+        return subprocess.run([sys.executable, str(SCRIPT), *map(str, args)],
+                              capture_output=True, text=True, timeout=10)
+
+    def run_zkevm_cli(self):
+        return self.run_cli("zkevm", "--fixtures", self.paths["fixtures"],
+                            "--metrics", self.paths["metrics"],
+                            "--converted", self.paths["converted_results"],
+                            "--client", "ethrex", "--zkvm", "zisk")
 
     def test_real_conversion_and_checker_cli_pass(self):
-        result = self.run_cli()
+        for args in (
+            ("hive", "--fixtures", self.paths["fixtures"], "--results", self.paths["hive_results"],
+             "--client", "go-ethereum_rlp-engineapi"),
+            ("hive", "--fixtures", self.paths["fixtures"],
+             "--results", self.paths["nimbus_hive_results"], "--client", "nimbus-el_rest-ssz"),
+        ):
+            with self.subTest(client=args[-1]):
+                result = self.run_cli(*args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                self.assertIn(f"Smoke passed: one {args[-1]} through Hive case.", result.stdout)
+        result = self.run_zkevm_cli()
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Smoke passed", result.stdout)
+        self.assertIn("Smoke passed: one ethrex on zisk case.", result.stdout)
+
+    def test_other_guest_and_zkvm_pass(self):
+        metrics = self.root / "zesu-metrics"
+        converted = self.root / "zesu-converted"
+        target = metrics / "zesu-tests@v21.0.0/zisk-v1.2.0-alpha/empty.json"
+        target.parent.mkdir(parents=True)
+        target.write_bytes(self.metric_path.read_bytes())
+        write_json(metrics / "hardware.json", {})
+        self.convert(metrics, converted)
+        smoke.check_zkevm(self.paths["fixtures"], metrics, converted, "zesu", "zisk")
+        with self.assertRaisesRegex(ValueError, "unexpected metric client or zkVM"):
+            smoke.check_zkevm(self.paths["fixtures"], metrics, converted, "zesu", "sp1")
 
     def test_missing_outputs_fail_including_hardware_only_metrics(self):
         for path in (self.hive_path, self.nimbus_path, self.metric_path, self.converted_path):
@@ -162,7 +195,7 @@ class CheckSmokeResultsTests(unittest.TestCase):
         suite = read_json(self.nimbus_path)
         suite["clientVersions"] = {"nimbus-el_rlp-engineapi": "version"}
         write_json(self.nimbus_path, suite)
-        with self.assertRaisesRegex(ValueError, "unexpected Nimbus Hive client"):
+        with self.assertRaisesRegex(ValueError, "unexpected Hive client"):
             self.check()
 
     def test_guest_crash_mismatch_or_missing_execution_fails(self):
@@ -231,7 +264,7 @@ class CheckSmokeResultsTests(unittest.TestCase):
 
     def test_malformed_result_exits_with_error(self):
         self.metric_path.write_text("invalid json")
-        result = self.run_cli()
+        result = self.run_zkevm_cli()
         self.assertEqual(result.returncode, 1)
         self.assertIn("smoke failed:", result.stderr)
 
