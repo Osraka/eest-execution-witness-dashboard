@@ -31,7 +31,7 @@ HIVE_UI_REF=b5441f735366a4f7d13575a020ccd6517d7ecaf3
 HIVE_UI_DISCOVERY_NAME=zkEVM
 
 ZKEVM_BENCHMARK_WORKLOAD_REPO=https://github.com/eth-act/zkevm-benchmark-workload.git
-ZKEVM_BENCHMARK_WORKLOAD_REF=v0.18.0
+ZKEVM_BENCHMARK_WORKLOAD_REF=v0.18.1
 ZKEVM_WORKLOAD_RUNS=ethrex:zisk,reth:zisk
 ZKEVM_RAYON_THREADS=10
 
@@ -72,8 +72,9 @@ default EEST pin, `tests-zkevm@v21.0.1`; older refs lack `--ssz`.
 
 ### zkEVM guests
 
-Workload `v0.18.0` downloads guests from the `ere-guests` `v0.18.0` release.
-It provides Ethrex and Reth on SP1, ZisK, and OpenVM, and Nimbus on ZisK only.
+Workload `v0.18.1` downloads guests from the `ere-guests` `v0.18.1` release.
+It provides Ethrex and Reth on SP1, ZisK, and OpenVM, and Zesu and Nimbus on
+ZisK only.
 The Nimbus guest ID is `nimbus`; its Hive client ID is `nimbus-el`.
 
 ### Generated directories
@@ -89,7 +90,7 @@ Scripts write checkouts and outputs to git-ignored directories:
 
 The **Refresh execution witness dashboard** workflow
 (`.github/workflows/refresh-dashboard.yml`) prepares a dataset, runs six Hive
-client configurations and seven zkEVM runs, and publishes the site. It runs
+client configurations and eight zkEVM runs, and publishes the site. It runs
 every Monday and Thursday at 03:17 UTC. To run it now:
 
 ```bash
@@ -100,10 +101,11 @@ Only one refresh runs at a time; a new one waits for the current one to finish.
 Each refresh uses:
 
 - The prefilled EEST release `tests-zkevm@v21.0.1`, Hive `master`,
-  `zkevm-benchmark-workload` `v0.18.0`, and 10 Rayon threads.
+  `zkevm-benchmark-workload` `v0.18.1`, and 10 Rayon threads.
 - Hive clients `ethrex,go-ethereum,nimbus-el,nethermind,besu,nimbus-el-rest`,
   with the checked-in descriptors.
-- zkEVM runs for Ethrex and Reth on SP1, ZisK, and OpenVM, and Nimbus on ZisK.
+- zkEVM runs for Ethrex and Reth on SP1, ZisK, and OpenVM, and Zesu and Nimbus
+  on ZisK.
 - hive-ui commit `b5441f735366a4f7d13575a020ccd6517d7ecaf3` and a 900 MiB
   site limit.
 
